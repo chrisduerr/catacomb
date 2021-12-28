@@ -35,7 +35,12 @@ pub struct Catacomb {
 
 impl Catacomb {
     /// Initialize the compositor.
-    pub fn new(mut display: Display, output: Output, event_loop: &mut EventLoop<Self>) -> Self {
+    pub fn new(
+        mut display: Display,
+        output: Output,
+        event_loop: &mut EventLoop<Self>,
+        renderer: &mut Gles2Renderer,
+    ) -> Self {
         // Create our Wayland socket.
         let socket_name = &mut display
             .add_socket_auto()
@@ -87,7 +92,7 @@ impl Catacomb {
             .expect("adding keyboard");
 
         // Initialize all available shells.
-        let shells = Shells::new(&mut display);
+        let shells = Shells::new(&mut display, renderer);
 
         Self {
             display: Rc::new(RefCell::new(display)),

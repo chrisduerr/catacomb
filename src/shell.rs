@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 use smithay::backend::renderer;
-use smithay::backend::renderer::gles2::Gles2Texture;
+use smithay::backend::renderer::gles2::{Gles2Renderer, Gles2Texture};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
@@ -28,11 +28,11 @@ pub struct Shells {
 
 impl Shells {
     /// Initialize all available shells.
-    pub fn new(display: &mut Display) -> Self {
+    pub fn new(display: &mut Display, renderer: &mut Gles2Renderer) -> Self {
         // Create the compositor and register a surface commit handler.
         compositor::compositor_init(display, surface_commit, None);
 
-        let windows = Rc::new(RefCell::new(Windows::new()));
+        let windows = Rc::new(RefCell::new(Windows::new(renderer)));
 
         let xdg_windows = windows.clone();
         let _ = xdg_shell::xdg_shell_init(

@@ -2,13 +2,13 @@
 
 use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
-use std::cmp::Ordering;
+use std::cmp::{self, Ordering};
+use std::mem;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
-use std::{cmp, mem};
 
-use smithay::backend::renderer::gles2::{Gles2Frame, Gles2Renderer, Gles2Texture};
-use smithay::backend::renderer::{self, BufferType, Frame, ImportAll, Transform};
+use smithay::backend::renderer::gles2::{Gles2Error, Gles2Frame, Gles2Renderer};
+use smithay::backend::renderer::{self, BufferType, ImportAll};
 use smithay::reexports::wayland_protocols::unstable::xdg_decoration;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
@@ -19,6 +19,9 @@ use smithay::wayland::shell::xdg::{SurfaceCachedState, ToplevelSurface};
 use wayland_protocols::xdg_shell::server::xdg_toplevel::State;
 use xdg_decoration::v1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
+use crate::drawing::Texture;
+use crate::geometry::CatacombVector;
+use crate::input::HOLD_DURATION;
 use crate::output::Output;
 use crate::shell::SurfaceBuffer;
 
@@ -34,11 +37,14 @@ const FG_OVERVIEW_PERCENTAGE: f64 = 0.75;
 /// Percentage of remaining space reserved for background windows in the application overview.
 const BG_OVERVIEW_PERCENTAGE: f64 = 0.5;
 
-/// Time before a tap is considered a hold.
-const HOLD_DURATION: Duration = Duration::from_secs(1);
-
 /// Percentage of the output height a window can be moved before closing it in the overview.
 const OVERVIEW_CLOSE_DISTANCE: f64 = 0.5;
+
+/// Color of the hovered overview tiling location highlight.
+const ACTIVE_DROP_TARGET_RGBA: [u8; 4] = [0, 0, 0, 64];
+
+/// Color of the overview tiling location highlight.
+const DROP_TARGET_RGBA: [u8; 4] = [0, 0, 0, 128];
 
 /// Animation speed for the return from close, lower means faster.
 const CLOSE_CANCEL_ANIMATION_SPEED: f64 = 0.3;
@@ -49,70 +55,22 @@ const OVERDRAG_ANIMATION_SPEED: f64 = 25.;
 /// Maximum amount of overdrag before inputs are ignored.
 const OVERDRAG_LIMIT: f64 = 3.;
 
-/// Compositor window arrangements.
-#[derive(Copy, Clone, PartialEq, Debug)]
-enum View {
-    /// List of all open windows.
-    Overview(Overview),
-    /// Currently active windows.
-    Workspace,
-}
-
-impl Default for View {
-    fn default() -> Self {
-        View::Workspace
-    }
-}
-
-/// Overview view state.
-#[derive(Default, Copy, Clone, PartialEq, Debug)]
-struct Overview {
-    x_offset: f64,
-    y_offset: f64,
-    last_overdrag_step: Option<Instant>,
-    close_release_pending: bool,
-    hold_start: Option<Instant>,
-}
-
-impl Overview {
-    /// Index of the focused window.
-    fn focused_index(&self, window_count: usize) -> usize {
-        (self.x_offset.min(0.).abs().round() as usize).min(window_count - 1)
-    }
-
-    /// Focused window bounds.
-    fn focused_bounds(
-        &self,
-        output_size: Size<i32, Logical>,
-        window_count: usize,
-    ) -> Rectangle<i32, Logical> {
-        let window_size = scale_size(output_size, FG_OVERVIEW_PERCENTAGE);
-        let x = overview_x_position(
-            FG_OVERVIEW_PERCENTAGE,
-            BG_OVERVIEW_PERCENTAGE,
-            output_size.w,
-            window_size.w,
-            self.focused_index(window_count) as f64 + self.x_offset,
-        );
-        let y = (output_size.h - window_size.h) / 2;
-        Rectangle::from_loc_and_size((x, y), window_size)
-    }
-}
-
 /// Container tracking all known clients.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Windows {
     windows: Vec<Rc<RefCell<Window>>>,
     primary: Weak<RefCell<Window>>,
     secondary: Weak<RefCell<Window>>,
     transaction: Option<Transaction>,
     start_time: Instant,
+    graphics: Graphics,
     view: View,
 }
 
-impl Default for Windows {
-    fn default() -> Self {
+impl Windows {
+    pub fn new(renderer: &mut Gles2Renderer) -> Self {
         Self {
+            graphics: Graphics::new(renderer).expect("texture creation error"),
             start_time: Instant::now(),
             transaction: Default::default(),
             secondary: Default::default(),
@@ -120,12 +78,6 @@ impl Default for Windows {
             primary: Default::default(),
             view: Default::default(),
         }
-    }
-}
-
-impl Windows {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Add a new window.
@@ -159,91 +111,15 @@ impl Windows {
     pub fn draw(&mut self, renderer: &mut Gles2Renderer, frame: &mut Gles2Frame, output: &Output) {
         self.update_transaction();
 
-        match &mut self.view {
+        match self.view {
             View::Workspace => {
                 self.with_visible(|window| window.draw(renderer, frame, output, 1., None));
             },
-            View::Overview(Overview { x_offset, y_offset, last_overdrag_step, .. }) => {
-                // Handle bounce-back from overdrag/cancelled application close.
-                let window_count = self.windows.len() as i32;
-                let min_offset = -window_count as f64 + 1.;
-                if let Some(last_overdrag_step) = last_overdrag_step {
-                    // Compute framerate-independent delta.
-                    let delta = last_overdrag_step.elapsed().as_millis() as f64;
-                    let overdrag_delta = delta / OVERDRAG_ANIMATION_SPEED;
-                    let close_delta = delta / CLOSE_CANCEL_ANIMATION_SPEED;
-
-                    // Overdrag bounce-back.
-                    if *x_offset > 0. {
-                        *x_offset -= overdrag_delta.min(*x_offset);
-                    } else if *x_offset < min_offset {
-                        *x_offset = (*x_offset + overdrag_delta).min(min_offset);
-                    }
-
-                    // Close window bounce-back.
-                    *y_offset -= close_delta.min(y_offset.abs()).copysign(*y_offset);
-
-                    *last_overdrag_step = Instant::now();
-                }
-
-                // Limit maximum overdrag.
-                *x_offset = x_offset.clamp(min_offset - OVERDRAG_LIMIT, OVERDRAG_LIMIT);
-
-                let (x_offset, y_offset) = (*x_offset, *y_offset);
-                self.draw_overview(renderer, frame, output, x_offset, y_offset);
+            View::Overview(mut overview @ Overview { floating_position: Some(_), .. }) => {
+                self.with_visible(|window| window.draw(renderer, frame, output, 1., None));
+                overview.draw_drag_and_drop(renderer, frame, output, &self.windows, &self.graphics);
             },
-        }
-    }
-
-    /// Render the application overview.
-    fn draw_overview(
-        &mut self,
-        renderer: &mut Gles2Renderer,
-        frame: &mut Gles2Frame,
-        output: &Output,
-        x_offset: f64,
-        y_offset: f64,
-    ) {
-        // Create an iterator over all windows in the overview.
-        //
-        // We start by going over all negative index windows from lowest to highest index and then
-        // proceed from highest to lowest index with the positive windows. This ensures that outer
-        // windows are rendered below the ones toward the center.
-        let window_count = self.windows.len() as i32;
-        let min_inc = x_offset.round() as i32;
-        let max_exc = window_count + x_offset.round() as i32;
-        let neg_iter = (min_inc..0).zip(0..window_count);
-        let pos_iter = (min_inc.max(0)..max_exc).zip(-min_inc.min(0)..window_count).rev();
-
-        // Maximum window size. Bigger windows will be truncated.
-        let output_size = output.size();
-        let max_size = scale_size(output_size, FG_OVERVIEW_PERCENTAGE);
-
-        // Render each window at the desired location in the overview.
-        for (position, i) in neg_iter.chain(pos_iter) {
-            let mut window = self.windows[i as usize].borrow_mut();
-
-            // Window scale.
-            let window_geometry = window.geometry();
-            let scale = (max_size.w as f64 / window_geometry.size.w as f64).min(1.);
-
-            // Window boundaries.
-            let x_position = overview_x_position(
-                FG_OVERVIEW_PERCENTAGE,
-                BG_OVERVIEW_PERCENTAGE,
-                output_size.w,
-                max_size.w,
-                position as f64 - x_offset.fract().round() + x_offset.fract(),
-            );
-            let y_position = (output_size.h - max_size.h) / 2;
-            let mut bounds = Rectangle::from_loc_and_size((x_position, y_position), max_size);
-
-            // Offset windows in the process of being closed.
-            if position == min_inc.max(0) {
-                bounds.loc.y += y_offset.round() as i32;
-            }
-
-            window.draw(renderer, frame, output, scale, Some(bounds));
+            View::Overview(mut overview) => overview.draw(renderer, frame, output, &self.windows),
         }
     }
 
@@ -264,11 +140,8 @@ impl Windows {
         // Open as secondary on long touch in overview.
         if let View::Overview(overview) = &mut self.view {
             if overview.hold_start.map_or(false, |start| start.elapsed() >= HOLD_DURATION) {
+                overview.floating_position = Some(Point::default());
                 overview.hold_start = None;
-
-                let index = overview.focused_index(self.windows.len());
-                self.set_secondary(output, index);
-                self.toggle_view();
             }
         }
     }
@@ -367,6 +240,8 @@ impl Windows {
             if window_bounds.contains(point.to_i32_round()) {
                 overview.hold_start = Some(Instant::now());
             }
+
+            overview.last_drag_point = point;
         }
     }
 
@@ -385,58 +260,92 @@ impl Windows {
             let index = overview.focused_index(self.windows.len());
 
             // Clear secondary unless *only* primary is empty.
+            self.set_primary(output, index);
             if self.primary.strong_count() > 0 {
                 self.set_secondary(output, None);
             }
-            self.set_primary(output, index);
 
             self.toggle_view();
         }
     }
 
-    /// Handle horizontal touch drag.
-    pub fn on_horizontal_drag(&mut self, delta: f64) {
-        if let View::Overview(overview) = &mut self.view {
-            overview.x_offset += delta / OVERVIEW_HORIZONTAL_SENSITIVITY;
-            overview.last_overdrag_step = None;
-            overview.hold_start = None;
-            overview.y_offset = 0.;
-        }
-    }
-
-    /// Handle vertical touch drag.
-    pub fn on_vertical_drag(&mut self, output: &Output, delta: f64) {
+    // TODO: Cleanup big time.
+    //
+    /// Handle a touch drag.
+    pub fn on_drag(&mut self, output: &Output, point: Point<f64, Logical>) {
         let overview = match &mut self.view {
-            View::Overview(view) if !view.close_release_pending => view,
+            View::Overview(overview) => overview,
             _ => return,
         };
 
-        overview.last_overdrag_step = None;
-        overview.hold_start = None;
-        overview.y_offset += delta;
+        let delta = point - mem::replace(&mut overview.last_drag_point, point);
 
-        // Close window once offset surpassed the threshold.
-        let close_distance = output.size().h as f64 * OVERVIEW_CLOSE_DISTANCE;
-        if overview.y_offset.abs() >= close_distance && !self.windows.is_empty() {
-            let index = overview.focused_index(self.windows.len());
-            self.windows[index].borrow_mut().surface.send_close();
-            self.windows.remove(index);
+        if let Some(floating_position) = &mut overview.floating_position {
+            *floating_position += delta;
+            return;
+        }
 
-            overview.last_overdrag_step = Some(Instant::now());
-            overview.close_release_pending = true;
-            overview.y_offset = 0.;
+        let drag_direction =
+            overview.drag_direction.get_or_insert(if delta.x.abs() >= delta.y.abs() {
+                Direction::Horizontal
+            } else {
+                Direction::Vertical
+            });
 
-            self.refresh_visible(output);
+        match drag_direction {
+            Direction::Horizontal => {
+                overview.x_offset += delta.x / OVERVIEW_HORIZONTAL_SENSITIVITY;
+                overview.last_overdrag_step = None;
+                overview.hold_start = None;
+                overview.y_offset = 0.;
+            },
+            Direction::Vertical if !overview.close_release_pending => {
+                overview.last_overdrag_step = None;
+                overview.hold_start = None;
+                overview.y_offset += delta.y;
+
+                // Close window once offset surpassed the threshold.
+                let close_distance = output.size().h as f64 * OVERVIEW_CLOSE_DISTANCE;
+                if overview.y_offset.abs() >= close_distance && !self.windows.is_empty() {
+                    let index = overview.focused_index(self.windows.len());
+                    self.windows[index].borrow_mut().surface.send_close();
+                    self.windows.remove(index);
+
+                    overview.last_overdrag_step = Some(Instant::now());
+                    overview.close_release_pending = true;
+                    overview.y_offset = 0.;
+
+                    self.refresh_visible(output);
+                }
+            },
+            _ => (),
         }
     }
 
     /// Handle touch release.
-    pub fn on_drag_release(&mut self) {
-        if let View::Overview(Overview { last_overdrag_step, close_release_pending, .. }) =
-            &mut self.view
-        {
-            *last_overdrag_step = Some(Instant::now());
-            *close_release_pending = false;
+    pub fn on_drag_release(&mut self, output: &Output) {
+        // TODO: Cleanup
+        if let View::Overview(overview) = &self.view {
+            if overview.floating_position.is_some() {
+                let output_size = output.size();
+                if overview.last_drag_point.y < output_size.h as f64 / 3. {
+                    let index = overview.focused_index(self.windows.len());
+                    self.set_primary(output, index);
+                    self.toggle_view();
+                    return;
+                } else if overview.last_drag_point.y >= output_size.h as f64 / 1.5 {
+                    let index = overview.focused_index(self.windows.len());
+                    self.set_secondary(output, index);
+                    self.toggle_view();
+                    return;
+                }
+            }
+        }
+
+        if let View::Overview(overview) = &mut self.view {
+            overview.last_overdrag_step = Some(Instant::now());
+            overview.close_release_pending = false;
+            overview.floating_position = None;
         }
     }
 
@@ -450,6 +359,13 @@ impl Windows {
         let transaction = self.transaction.get_or_insert(Transaction::new(self));
         let window = index.into().map(|index| &self.windows[index]);
 
+        // TODO: Formatting, best way to do it?
+        let weak_window =
+            window.map(Rc::downgrade).unwrap_or_else(|| mem::take(&mut transaction.secondary));
+        if weak_window.ptr_eq(&transaction.primary) {
+            return;
+        }
+
         // Update output's visible windows.
         if let Some(primary) = transaction.primary.upgrade() {
             primary.borrow_mut().leave(transaction, output);
@@ -459,13 +375,16 @@ impl Windows {
         }
 
         // Clear secondary if it's the new primary.
-        let weak_window = window.map(Rc::downgrade);
-        if weak_window.as_ref().map_or(false, |window| window.ptr_eq(&transaction.secondary)) {
+        if weak_window.ptr_eq(&transaction.secondary) {
             transaction.secondary = Weak::new();
         }
 
-        // Set primary and recompute window dimensions.
-        transaction.primary = weak_window.unwrap_or_else(|| mem::take(&mut transaction.secondary));
+        // Set primary and move old one to secondary if it is empty.
+        let old_primary = mem::replace(&mut transaction.primary, weak_window);
+        if transaction.secondary.strong_count() == 0 {
+            transaction.secondary = old_primary;
+        }
+
         transaction.update_dimensions(output);
     }
 
@@ -492,6 +411,213 @@ impl Windows {
         transaction.secondary = weak_window.unwrap_or_default();
         transaction.update_dimensions(output);
     }
+}
+
+/// Grahpics texture cache.
+#[derive(Debug)]
+struct Graphics {
+    active_drop_target: Texture,
+    drop_target: Texture,
+}
+
+impl Graphics {
+    fn new(renderer: &mut Gles2Renderer) -> Result<Self, Gles2Error> {
+        Ok(Self {
+            active_drop_target: Texture::from_buffer(renderer, &ACTIVE_DROP_TARGET_RGBA, 1, 1)?,
+            drop_target: Texture::from_buffer(renderer, &DROP_TARGET_RGBA, 1, 1)?,
+        })
+    }
+}
+
+/// Compositor window arrangements.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum View {
+    /// List of all open windows.
+    Overview(Overview),
+    /// Currently active windows.
+    Workspace,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View::Workspace
+    }
+}
+
+/// Overview view state.
+#[derive(Default, Copy, Clone, PartialEq, Debug)]
+struct Overview {
+    x_offset: f64,
+    y_offset: f64,
+    floating_position: Option<Point<f64, Logical>>,
+    last_drag_point: Point<f64, Logical>,
+    last_overdrag_step: Option<Instant>,
+    drag_direction: Option<Direction>,
+    close_release_pending: bool,
+    hold_start: Option<Instant>,
+}
+
+impl Overview {
+    /// Index of the focused window.
+    fn focused_index(&self, window_count: usize) -> usize {
+        (self.x_offset.min(0.).abs().round() as usize).min(window_count - 1)
+    }
+
+    /// Focused window bounds.
+    fn focused_bounds(
+        &self,
+        output_size: Size<i32, Logical>,
+        window_count: usize,
+    ) -> Rectangle<i32, Logical> {
+        let window_size = output_size.scale(FG_OVERVIEW_PERCENTAGE);
+        let x = overview_x_position(
+            FG_OVERVIEW_PERCENTAGE,
+            BG_OVERVIEW_PERCENTAGE,
+            output_size.w,
+            window_size.w,
+            self.focused_index(window_count) as f64 + self.x_offset,
+        );
+        let y = (output_size.h - window_size.h) / 2;
+        Rectangle::from_loc_and_size((x, y), window_size)
+    }
+
+    /// Clamp the X/Y offsets.
+    ///
+    /// This takes overdrag into account and will animate the bounce-back.
+    fn clamp_offset(&mut self, window_count: i32) {
+        // Limit maximum overdrag.
+        let min_offset = -window_count as f64 + 1.;
+        self.x_offset = self.x_offset.clamp(min_offset - OVERDRAG_LIMIT, OVERDRAG_LIMIT);
+
+        let last_overdrag_step = match &mut self.last_overdrag_step {
+            Some(last_overdrag_step) => last_overdrag_step,
+            None => return,
+        };
+
+        // Handle bounce-back from overdrag/cancelled application close.
+
+        // Compute framerate-independent delta.
+        let delta = last_overdrag_step.elapsed().as_millis() as f64;
+        let overdrag_delta = delta / OVERDRAG_ANIMATION_SPEED;
+        let close_delta = delta / CLOSE_CANCEL_ANIMATION_SPEED;
+
+        // Overdrag bounce-back.
+        if self.x_offset > 0. {
+            self.x_offset -= overdrag_delta.min(self.x_offset);
+        } else if self.x_offset < min_offset {
+            self.x_offset = (self.x_offset + overdrag_delta).min(min_offset);
+        }
+
+        // Close window bounce-back.
+        self.y_offset -= close_delta.min(self.y_offset.abs()).copysign(self.y_offset);
+
+        *last_overdrag_step = Instant::now();
+    }
+
+    /// Render the overview.
+    fn draw(
+        &mut self,
+        renderer: &mut Gles2Renderer,
+        frame: &mut Gles2Frame,
+        output: &Output,
+        windows: &[Rc<RefCell<Window>>],
+    ) {
+        let window_count = windows.len() as i32;
+        self.clamp_offset(window_count);
+
+        // Create an iterator over all windows in the overview.
+        //
+        // We start by going over all negative index windows from lowest to highest index and then
+        // proceed from highest to lowest index with the positive windows. This ensures that outer
+        // windows are rendered below the ones toward the center.
+        let min_inc = self.x_offset.round() as i32;
+        let max_exc = window_count + self.x_offset.round() as i32;
+        let neg_iter = (min_inc..0).zip(0..window_count);
+        let pos_iter = (min_inc.max(0)..max_exc).zip(-min_inc.min(0)..window_count).rev();
+
+        // Maximum window size. Bigger windows will be truncated.
+        let output_size = output.size();
+        let max_size = output_size.scale(FG_OVERVIEW_PERCENTAGE);
+
+        // Render each window at the desired location in the overview.
+        for (position, i) in neg_iter.chain(pos_iter) {
+            let mut window = windows[i as usize].borrow_mut();
+
+            // Window scale.
+            let window_geometry = window.geometry();
+            let scale = (max_size.w as f64 / window_geometry.size.w as f64).min(1.);
+
+            // Window boundaries.
+            let x_position = overview_x_position(
+                FG_OVERVIEW_PERCENTAGE,
+                BG_OVERVIEW_PERCENTAGE,
+                output_size.w,
+                max_size.w,
+                position as f64 - self.x_offset.fract().round() + self.x_offset.fract(),
+            );
+            let y_position = (output_size.h - max_size.h) / 2;
+            let mut bounds = Rectangle::from_loc_and_size((x_position, y_position), max_size);
+
+            // Offset windows in the process of being closed.
+            if position == min_inc.max(0) {
+                bounds.loc.y += self.y_offset.round() as i32;
+            }
+
+            window.draw(renderer, frame, output, scale, Some(bounds));
+        }
+    }
+
+    // TODO: Cleanup big time.
+    //
+    /// Draw the tiling location picker.
+    fn draw_drag_and_drop(
+        &mut self,
+        renderer: &mut Gles2Renderer,
+        frame: &mut Gles2Frame,
+        output: &Output,
+        windows: &[Rc<RefCell<Window>>],
+        graphics: &Graphics,
+    ) {
+        let output_size = output.size();
+
+        let scale = 0.8;
+        let size = output_size.scale(scale);
+        let loc = Point::from((
+            output_size.w / 2 - size.w / 2 + self.floating_position.unwrap().x as i32,
+            output_size.h / 2 - size.h / 2 + self.floating_position.unwrap().y as i32,
+        ));
+        let bounds = Rectangle::from_loc_and_size(loc, size);
+        let index = self.focused_index(windows.len());
+        let mut window = windows[index].borrow_mut();
+        window.draw(renderer, frame, output, scale, Some(bounds));
+
+        // TODO
+        let size = Size::from((output_size.w, output_size.h / 3));
+        let bounds = Rectangle::from_loc_and_size((0, 0), size);
+        let scale = cmp::max(output_size.w, output_size.h) as f64;
+        if self.last_drag_point.y < size.h as f64 {
+            graphics.active_drop_target.draw_at(frame, output, bounds, scale);
+        } else {
+            graphics.drop_target.draw_at(frame, output, bounds, scale);
+        }
+
+        // TODO
+        let size = Size::from((output_size.w, output_size.h / 3));
+        let bounds = Rectangle::from_loc_and_size((0, output_size.h - output_size.h / 3), size);
+        let scale = cmp::max(output_size.w, output_size.h) as f64;
+        if self.last_drag_point.y >= bounds.loc.y as f64 {
+            graphics.active_drop_target.draw_at(frame, output, bounds, scale);
+        } else {
+            graphics.drop_target.draw_at(frame, output, bounds, scale);
+        }
+    }
+}
+
+/// Directional plane.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Direction {
+    Horizontal,
+    Vertical,
 }
 
 /// Atomic changes to [`Windows`].
@@ -558,29 +684,6 @@ impl TextureCache {
     /// Add a new texture.
     fn push(&mut self, texture: Texture) {
         self.textures.push(texture);
-    }
-}
-
-/// Cached texture.
-///
-/// Includes all information necessary to render a surface's texture even after
-/// the surface itself has already died.
-#[derive(Clone, Debug)]
-struct Texture {
-    dimensions: Size<i32, Logical>,
-    location: Point<i32, Logical>,
-    texture: Rc<Gles2Texture>,
-    scale: i32,
-}
-
-impl Texture {
-    fn new(
-        texture: Rc<Gles2Texture>,
-        dimensions: Size<i32, Logical>,
-        location: Point<i32, Logical>,
-        scale: i32,
-    ) -> Self {
-        Self { texture, dimensions, location, scale }
     }
 }
 
@@ -718,47 +821,9 @@ impl Window {
             let loc = self.rectangle.loc + Size::from((x_offset, y_offset));
             Rectangle::from_loc_and_size(loc, output.size())
         });
-        self.draw_at(frame, output, bounds, scale);
-    }
 
-    /// Render the window at the specified location.
-    ///
-    /// Using the `window_bounds` and `window_scale` parameters, it is possible to scale the
-    /// surface and truncate it to be within the specified window bounds. The scaling will always
-    /// take part **before** the truncation.
-    fn draw_at(
-        &self,
-        frame: &mut Gles2Frame,
-        output: &Output,
-        window_bounds: Rectangle<i32, Logical>,
-        window_scale: f64,
-    ) {
-        let scaled_window_bounds = scale_size(window_bounds.size, 1. / window_scale);
-        for Texture { texture, dimensions, location, scale } in &self.texture_cache.textures {
-            // Skip textures completely outside of the window bounds.
-            if location.x >= scaled_window_bounds.w || location.y >= scaled_window_bounds.h {
-                continue;
-            }
-
-            // Truncate source size based on window bounds.
-            let surface_bounds = scaled_window_bounds - *location;
-            let src_size = Size::from((
-                cmp::min(dimensions.w, surface_bounds.w),
-                cmp::min(dimensions.h, surface_bounds.h),
-            ));
-            let src = Rectangle::from_loc_and_size((0, 0), src_size);
-
-            // Scale output size based on window scale.
-            let location = window_bounds.loc + scale_location(*location, window_scale);
-            let dest = Rectangle::from_loc_and_size(location, scale_size(src_size, window_scale));
-
-            let _ = frame.render_texture_from_to(
-                texture,
-                src.to_buffer(*scale),
-                dest.to_f64().to_physical(output.scale),
-                Transform::Normal,
-                1.,
-            );
+        for texture in &self.texture_cache.textures {
+            texture.draw_at(frame, output, bounds, scale);
         }
     }
 
@@ -891,16 +956,6 @@ impl Window {
 
         self.rectangle = transaction.rectangle;
     }
-}
-
-/// Scale a size by a scaling factor.
-fn scale_size(size: Size<i32, Logical>, scale: f64) -> Size<i32, Logical> {
-    Size::from((size.w as f64 * scale, size.h as f64 * scale)).to_i32_round()
-}
-
-/// Scale a location by a scaling factor.
-fn scale_location(location: Point<i32, Logical>, scale: f64) -> Point<i32, Logical> {
-    Point::from((location.x as f64 * scale, location.y as f64 * scale)).to_i32_round()
 }
 
 /// Calculate the X coordinate of a window in the application overview based on its position.

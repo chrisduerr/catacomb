@@ -1,6 +1,6 @@
 //! Input event handling.
 
-use std::mem;
+use std::time::{Duration, Instant};
 
 use smithay::backend::input::{
     Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerButtonEvent,
@@ -13,6 +13,9 @@ use smithay::wayland::SERIAL_COUNTER;
 
 use crate::catacomb::Catacomb;
 use crate::output::Orientation;
+
+/// Time before a tap is considered a hold.
+pub const HOLD_DURATION: Duration = Duration::from_secs(1);
 
 /// Maximum distance before touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
@@ -28,16 +31,12 @@ impl TouchState {
     /// Get the updated active touch action.
     fn action(&mut self) -> &mut Option<TouchAction> {
         // Change state to drag when tap deadzone tolerance was exceeded.
-        if let Some(TouchAction::Tap { position }) = self.action {
+        if let Some(TouchAction::Tap { position, touch_start }) = self.action {
             let delta = position - self.position;
-            if f64::sqrt(delta.x.powi(2) + delta.y.powi(2)) > MAX_TAP_DISTANCE {
-                let direction = if delta.x.abs() >= delta.y.abs() {
-                    Direction::Horizontal
-                } else {
-                    Direction::Vertical
-                };
-
-                self.action = Some(TouchAction::Drag { last_position: position, direction });
+            if f64::sqrt(delta.x.powi(2) + delta.y.powi(2)) > MAX_TAP_DISTANCE
+                || touch_start.elapsed() >= HOLD_DURATION
+            {
+                self.action = Some(TouchAction::Drag);
             }
         }
 
@@ -48,21 +47,14 @@ impl TouchState {
 /// Available touch input actions.
 #[derive(Copy, Clone)]
 enum TouchAction {
-    Tap { position: Point<f64, Logical> },
-    Drag { last_position: Point<f64, Logical>, direction: Direction },
+    Tap { position: Point<f64, Logical>, touch_start: Instant },
+    Drag,
 }
 
 impl TouchAction {
     fn new(position: Point<f64, Logical>) -> Self {
-        TouchAction::Tap { position }
+        TouchAction::Tap { touch_start: Instant::now(), position }
     }
-}
-
-/// Directional plane.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum Direction {
-    Horizontal,
-    Vertical,
 }
 
 impl Catacomb {
@@ -90,13 +82,13 @@ impl Catacomb {
             InputEvent::Keyboard { event, .. } => self.handle_keyboard_input(event),
             InputEvent::PointerButton { event } if event.button() == Some(MouseButton::Left) => {
                 let mut windows = self.windows.borrow_mut();
-                self.touch_state.action = match &self.touch_state.action {
+                self.touch_state.action = match self.touch_state.action() {
                     Some(TouchAction::Tap { position, .. }) => {
                         windows.on_tap(&self.output, *position);
                         None
                     },
-                    Some(TouchAction::Drag { .. }) => {
-                        windows.on_drag_release();
+                    Some(TouchAction::Drag) => {
+                        windows.on_drag_release(&self.output);
                         None
                     },
                     None => {
@@ -108,18 +100,8 @@ impl Catacomb {
             InputEvent::PointerMotionAbsolute { event } => {
                 let position = event.position_transformed(self.output.size());
 
-                if let Some(TouchAction::Drag { last_position, direction }) =
-                    self.touch_state.action()
-                {
-                    let delta = position - mem::replace(last_position, position);
-                    match direction {
-                        Direction::Horizontal => {
-                            self.windows.borrow_mut().on_horizontal_drag(delta.x);
-                        },
-                        Direction::Vertical => {
-                            self.windows.borrow_mut().on_vertical_drag(&self.output, delta.y);
-                        },
-                    }
+                if let Some(TouchAction::Drag) = self.touch_state.action() {
+                    self.windows.borrow_mut().on_drag(&self.output, position);
                 }
 
                 self.touch_state.position = position;

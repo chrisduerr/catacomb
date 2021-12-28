@@ -1,0 +1,8 @@
+ - Add black background to fill empty space behind smaller windows in overview?
+    -> Or maybe send resize request?
+ - layer shell
+ - Touch velocity in overview (wait for udev?)
+ - udev
+ - Phone testing setup
+ - Add animation in overview for following-windows when window is closed
+ - Implement Drag & Drop for set_secondary from overview

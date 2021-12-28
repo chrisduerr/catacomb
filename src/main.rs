@@ -14,6 +14,8 @@ use crate::catacomb::Catacomb;
 use crate::output::Output;
 
 mod catacomb;
+mod drawing;
+mod geometry;
 mod input;
 mod output;
 mod shell;
@@ -45,8 +47,11 @@ fn main() {
         size: (0, 0).into(),
     });
 
-    let mut event_loop: EventLoop<'_, Catacomb> = EventLoop::try_new().expect("event loop");
-    let mut catacomb = Catacomb::new(display, output, &mut event_loop);
+    let mut event_loop = EventLoop::try_new().expect("event loop");
+    let mut catacomb = {
+        let mut graphics = graphics.borrow_mut();
+        Catacomb::new(display, output, &mut event_loop, graphics.renderer())
+    };
 
     let display = catacomb.display.clone();
     loop {
