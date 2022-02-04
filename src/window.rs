@@ -55,12 +55,12 @@ pub struct Windows {
 }
 
 impl Windows {
-    pub fn new(renderer: &mut Gles2Renderer, output: &Output) -> Self {
+    pub fn new() -> Self {
         Self {
-            graphics: Graphics::new(renderer, output).expect("texture creation error"),
             start_time: Instant::now(),
             transaction: Default::default(),
             secondary: Default::default(),
+            graphics: Default::default(),
             windows: Default::default(),
             primary: Default::default(),
             layers: Default::default(),

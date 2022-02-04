@@ -57,7 +57,7 @@ impl TouchAction {
     }
 }
 
-impl Catacomb {
+impl<B> Catacomb<B> {
     /// Process winit-specific input events.
     pub fn handle_winit_input(&mut self, event: WinitEvent) {
         match event {
@@ -77,7 +77,7 @@ impl Catacomb {
     }
 
     /// Process new input events.
-    fn handle_input<B: InputBackend>(&mut self, event: InputEvent<B>) {
+    pub fn handle_input<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => self.handle_keyboard_input(event),
             InputEvent::PointerButton { event } if event.button() == Some(MouseButton::Left) => {
@@ -111,7 +111,7 @@ impl Catacomb {
     }
 
     /// Handle new keyboard input events.
-    fn handle_keyboard_input<B: InputBackend>(&mut self, event: impl KeyboardKeyEvent<B>) {
+    fn handle_keyboard_input<I: InputBackend>(&mut self, event: impl KeyboardKeyEvent<I>) {
         let serial = SERIAL_COUNTER.next_serial();
         let time = Event::time(&event);
         let keycode = event.key_code();

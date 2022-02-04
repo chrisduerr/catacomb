@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use smithay::backend::renderer::gles2::Gles2Renderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::shell::wlr_layer::{self, LayerShellRequest};
@@ -12,7 +11,6 @@ use smithay::wayland::{compositor, SERIAL_COUNTER};
 use wayland_commons::filter::DispatchData;
 
 use crate::catacomb::Catacomb;
-use crate::output::Output;
 use crate::window::Windows;
 
 /// Wayland shells.
@@ -22,11 +20,11 @@ pub struct Shells {
 
 impl Shells {
     /// Initialize all available shells.
-    pub fn new(display: &mut Display, renderer: &mut Gles2Renderer, output: &Output) -> Self {
+    pub fn new<B: 'static>(display: &mut Display) -> Self {
         // Create the compositor and register a surface commit handler.
-        compositor::compositor_init(display, surface_commit, None);
+        compositor::compositor_init(display, surface_commit::<B>, None);
 
-        let windows = Rc::new(RefCell::new(Windows::new(renderer, output)));
+        let windows = Rc::new(RefCell::new(Windows::new()));
 
         // XDG Shell.
         let xdg_windows = windows.clone();
@@ -35,7 +33,7 @@ impl Shells {
             move |event, mut data| match event {
                 XdgRequest::NewToplevel { surface } => {
                     // Automatically focus new windows.
-                    let catacomb = data.get::<Catacomb>().unwrap();
+                    let catacomb = data.get::<Catacomb<B>>().unwrap();
                     if let Some(wl_surface) = surface.get_surface() {
                         catacomb.keyboard.set_focus(Some(wl_surface), SERIAL_COUNTER.next_serial());
                     }
@@ -73,11 +71,11 @@ impl Shells {
 }
 
 /// Handle a new surface commit.
-fn surface_commit(surface: WlSurface, mut data: DispatchData) {
+fn surface_commit<B: 'static>(surface: WlSurface, mut data: DispatchData) {
     if compositor::is_sync_subsurface(&surface) {
         return;
     }
 
-    let catacomb = data.get::<Catacomb>().unwrap();
+    let catacomb = data.get::<Catacomb<B>>().unwrap();
     catacomb.windows.borrow_mut().surface_commit(&surface, &mut catacomb.output);
 }

@@ -23,24 +23,26 @@ use crate::shell::Shells;
 use crate::window::Windows;
 
 /// Shared compositor state.
-pub struct Catacomb {
+pub struct Catacomb<B> {
     pub windows: Rc<RefCell<Windows>>,
     pub keyboard: KeyboardHandle,
     pub touch_state: TouchState,
+    pub seat_name: String,
     pub terminated: bool,
     pub output: Output,
+    pub backend: B,
 
     // NOTE: Must be last field to ensure it's dropped after any global.
     pub display: Rc<RefCell<Display>>,
 }
 
-impl Catacomb {
+impl<B: Backend + 'static> Catacomb<B> {
     /// Initialize the compositor.
     pub fn new(
         mut display: Display,
         output: Output,
+        backend: B,
         event_loop: &mut EventLoop<Self>,
-        renderer: &mut Gles2Renderer,
     ) -> Self {
         // Create our Wayland socket.
         let socket_name = &mut display
@@ -76,7 +78,8 @@ impl Catacomb {
         );
 
         // Initialize input.
-        let (mut seat, _) = Seat::new(&mut display, String::from("seat-0"), None);
+        let seat_name = backend.seat_name();
+        let (mut seat, _) = Seat::new(&mut display, seat_name.clone(), None);
         data_device::init_data_device(
             &mut display,
             |_| {},
@@ -93,7 +96,7 @@ impl Catacomb {
             .expect("adding keyboard");
 
         // Initialize all available shells.
-        let shells = Shells::new(&mut display, renderer, &output);
+        let shells = Shells::new::<B>(&mut display);
 
         // XDG output protocol.
         xdg::init_xdg_output_manager(&mut display, None);
@@ -101,7 +104,9 @@ impl Catacomb {
         Self {
             display: Rc::new(RefCell::new(display)),
             windows: shells.windows,
+            seat_name,
             keyboard,
+            backend,
             output,
             touch_state: Default::default(),
             terminated: Default::default(),
@@ -126,4 +131,8 @@ impl Catacomb {
     pub fn draw(&mut self, renderer: &mut Gles2Renderer, frame: &mut Gles2Frame) {
         self.windows.borrow_mut().draw(renderer, frame, &self.output);
     }
+}
+
+pub trait Backend {
+    fn seat_name(&self) -> String;
 }

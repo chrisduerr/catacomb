@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.58.0"
 
+[[bin]]
+name = "udev"
+path = "src/udev.rs"
+
+[[bin]]
+name = "winit"
+path = "src/winit.rs"
+
 [dependencies]
 smithay = { git = "https://github.com/chrisduerr/smithay", rev = "3550afb969b010fc662a95784e84e68662e8a0ea", features = ["use_system_lib"] }
 wayland-protocols = "0.29.1"

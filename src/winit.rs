@@ -11,7 +11,7 @@ use smithay::utils::{Rectangle, Transform};
 use smithay::wayland::dmabuf;
 use smithay::wayland::output::{Mode, PhysicalProperties};
 
-use crate::catacomb::Catacomb;
+use crate::catacomb::{Backend, Catacomb};
 use crate::output::Output;
 
 mod catacomb;
@@ -23,6 +23,14 @@ mod output;
 mod overview;
 mod shell;
 mod window;
+
+struct Winit;
+
+impl Backend for Winit {
+    fn seat_name(&self) -> String {
+        String::from("seat-0")
+    }
+}
 
 fn main() {
     let mut display = Display::new();
@@ -53,10 +61,7 @@ fn main() {
     });
 
     let mut event_loop = EventLoop::try_new().expect("event loop");
-    let mut catacomb = {
-        let mut graphics = graphics.borrow_mut();
-        Catacomb::new(display, output, &mut event_loop, graphics.renderer())
-    };
+    let mut catacomb = Catacomb::new(display, output, Winit, &mut event_loop);
 
     let display = catacomb.display.clone();
     loop {

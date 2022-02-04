@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 
 use smithay::backend::renderer;
-use smithay::backend::renderer::gles2::{ffi, Gles2Error, Gles2Frame, Gles2Renderer, Gles2Texture};
+use smithay::backend::renderer::gles2::{ffi, Gles2Frame, Gles2Renderer, Gles2Texture};
 use smithay::backend::renderer::Frame;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
@@ -79,32 +79,34 @@ impl Texture {
         buffer: &[u8],
         width: i32,
         height: i32,
-    ) -> Result<Self, Gles2Error> {
+    ) -> Self {
         assert!(buffer.len() as i32 >= width * height * 4);
 
-        let texture = renderer.with_context(|renderer, gl| unsafe {
-            let mut tex = 0;
-            gl.GenTextures(1, &mut tex);
-            gl.BindTexture(ffi::TEXTURE_2D, tex);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexImage2D(
-                ffi::TEXTURE_2D,
-                0,
-                ffi::RGBA as i32,
-                width,
-                height,
-                0,
-                ffi::RGBA,
-                ffi::UNSIGNED_BYTE as u32,
-                buffer.as_ptr() as *const _,
-            );
-            gl.BindTexture(ffi::TEXTURE_2D, 0);
+        let texture = renderer
+            .with_context(|renderer, gl| unsafe {
+                let mut tex = 0;
+                gl.GenTextures(1, &mut tex);
+                gl.BindTexture(ffi::TEXTURE_2D, tex);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                gl.TexImage2D(
+                    ffi::TEXTURE_2D,
+                    0,
+                    ffi::RGBA as i32,
+                    width,
+                    height,
+                    0,
+                    ffi::RGBA,
+                    ffi::UNSIGNED_BYTE as u32,
+                    buffer.as_ptr() as *const _,
+                );
+                gl.BindTexture(ffi::TEXTURE_2D, 0);
 
-            Gles2Texture::from_raw(renderer, tex, (width, height).into())
-        })?;
+                Gles2Texture::from_raw(renderer, tex, (width, height).into())
+            })
+            .expect("create texture");
 
-        Ok(Texture::new(Rc::new(texture), (width, height)))
+        Texture::new(Rc::new(texture), (width, height))
     }
 
     /// Render the texture at the specified location.
@@ -152,30 +154,34 @@ impl Texture {
 }
 
 /// Grahpics texture cache.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Graphics {
-    pub active_drop_target: Texture,
-    pub drop_target: Texture,
-    decoration: Texture,
+    active_drop_target: Option<Texture>,
+    drop_target: Option<Texture>,
+    decoration: Option<Texture>,
 }
 
 impl Graphics {
-    pub fn new(renderer: &mut Gles2Renderer, output: &Output) -> Result<Self, Gles2Error> {
-        Ok(Self {
-            active_drop_target: Texture::from_buffer(renderer, &ACTIVE_DROP_TARGET_RGBA, 1, 1)?,
-            drop_target: Texture::from_buffer(renderer, &DROP_TARGET_RGBA, 1, 1)?,
-            decoration: Self::create_decoration(renderer, output)?,
-        })
-    }
-
     /// Get the window decoration texture corresponding to the active output size.
     pub fn decoration(&mut self, renderer: &mut Gles2Renderer, output: &Output) -> &Texture {
-        if self.decoration.size != Self::decoration_size(output) {
-            self.decoration = Self::create_decoration(renderer, output)
-                .expect("decoration texture creation error");
+        let expected_size = Self::decoration_size(output);
+        if self.decoration.as_ref().map(|decoration| decoration.size) != Some(expected_size) {
+            self.decoration = None;
         }
 
-        &self.decoration
+        self.decoration.get_or_insert_with(|| Self::create_decoration(renderer, output))
+    }
+
+    /// Get the texture for the hovered overview drop target area.
+    pub fn active_drop_target(&mut self, renderer: &mut Gles2Renderer) -> &Texture {
+        self.active_drop_target
+            .get_or_insert_with(|| Texture::from_buffer(renderer, &ACTIVE_DROP_TARGET_RGBA, 1, 1))
+    }
+
+    /// Get the texture for the unfocused overview drop target area.
+    pub fn drop_target(&mut self, renderer: &mut Gles2Renderer) -> &Texture {
+        self.drop_target
+            .get_or_insert_with(|| Texture::from_buffer(renderer, &DROP_TARGET_RGBA, 1, 1))
     }
 
     /// Decoration title bar height.
@@ -189,10 +195,7 @@ impl Graphics {
     }
 
     /// Create overview window decoration.
-    fn create_decoration(
-        renderer: &mut Gles2Renderer,
-        output: &Output,
-    ) -> Result<Texture, Gles2Error> {
+    fn create_decoration(renderer: &mut Gles2Renderer, output: &Output) -> Texture {
         let size = Self::decoration_size(output);
         let title_height = Self::title_height(output) as usize;
         let border_width = Self::border_width(output) as usize;

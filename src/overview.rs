@@ -242,9 +242,9 @@ impl DragAndDrop {
         let scale = cmp::max(available.size.w, available.size.h) as f64;
         for bounds in [primary_bounds, secondary_bounds] {
             if bounds.to_f64().contains(self.touch_position) {
-                graphics.active_drop_target.draw_at(frame, output, bounds, scale);
+                graphics.active_drop_target(renderer).draw_at(frame, output, bounds, scale);
             } else {
-                graphics.drop_target.draw_at(frame, output, bounds, scale);
+                graphics.drop_target(renderer).draw_at(frame, output, bounds, scale);
             }
         }
 
