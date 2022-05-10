@@ -159,9 +159,9 @@ impl Overview {
                 (bounds.loc.x - border_width, bounds.loc.y - title_height),
                 decoration.size(),
             );
-            decoration.draw_at(frame, output, decoration_bounds, 1.);
+            decoration.draw_at(frame, output, decoration_bounds, 1., 0);
 
-            window.draw(renderer, frame, output, FG_OVERVIEW_PERCENTAGE, bounds);
+            window.draw(renderer, frame, output, FG_OVERVIEW_PERCENTAGE, bounds, 0);
         }
     }
 
@@ -235,11 +235,11 @@ impl DragAndDrop {
             (bounds.loc.x - border_width, bounds.loc.y - title_height),
             decoration.size(),
         );
-        decoration.draw_at(frame, output, decoration_bounds, 1.);
+        decoration.draw_at(frame, output, decoration_bounds, 1., 0);
 
         // Render the window being drag-and-dropped.
         let mut window = windows[self.window_index].borrow_mut();
-        window.draw(renderer, frame, output, FG_OVERVIEW_PERCENTAGE, bounds);
+        window.draw(renderer, frame, output, FG_OVERVIEW_PERCENTAGE, bounds, 0);
 
         // Set custom OpenGL blending function.
         let _ = renderer.with_context(|_, gl| unsafe {
@@ -253,9 +253,13 @@ impl DragAndDrop {
         let scale = cmp::max(available.size.w, available.size.h) as f64;
         for bounds in [primary_bounds, secondary_bounds] {
             if bounds.to_f64().contains(self.touch_position) {
-                graphics.active_drop_target(renderer).draw_at(frame, output, bounds, scale);
+                graphics
+                    .active_drop_target(renderer, output.scale())
+                    .draw_at(frame, output, bounds, scale, 0);
             } else {
-                graphics.drop_target(renderer).draw_at(frame, output, bounds, scale);
+                graphics
+                    .drop_target(renderer, output.scale())
+                    .draw_at(frame, output, bounds, scale, 0);
             }
         }
 

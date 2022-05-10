@@ -1,6 +1,7 @@
 use std::env;
 
 mod catacomb;
+mod config;
 mod drawing;
 mod geometry;
 mod input;
@@ -12,7 +13,6 @@ mod shell;
 mod udev;
 mod window;
 mod winit;
-mod config;
 
 fn main() {
     // Do not turn children into zombies.

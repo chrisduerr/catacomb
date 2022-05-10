@@ -1,8 +1,9 @@
 use std::cell::RefCell;
+use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
-use std::error::Error;
 
+use smithay::backend::renderer::gles2::{Gles2Frame, Gles2Renderer};
 use smithay::backend::renderer::{ImportDma, ImportEgl, Renderer, TextureFilter};
 use smithay::backend::winit::{self, WinitGraphicsBackend};
 use smithay::reexports::calloop::EventLoop;
@@ -68,12 +69,20 @@ pub fn run() {
 }
 
 impl Render for &mut WinitGraphicsBackend {
-    fn render<B>(&mut self, catacomb: &mut Catacomb<B>) -> Result<(), Box<dyn Error>> {
+    fn render<B, F>(
+        &mut self,
+        catacomb: &mut Catacomb<B>,
+        draw_fun: F,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: FnOnce(&mut Catacomb<B>, &mut Gles2Renderer, &mut Gles2Frame, u8),
+    {
         let logical_size = catacomb.output.resolution().to_f64();
         let output_size = logical_size.to_physical(catacomb.output.scale()).to_i32_round();
+        let buffer_age = self.buffer_age().unwrap_or(0) as u8;
         self.renderer()
             .render(output_size, Transform::Flipped180, |renderer, frame| {
-                catacomb.draw(renderer, frame)
+                draw_fun(catacomb, renderer, frame, buffer_age);
             })
             .expect("render");
         self.submit(None, 1.0).expect("submit");

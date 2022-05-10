@@ -9,12 +9,13 @@ use smithay::backend::drm::{DevPath, DrmDevice, DrmEvent, GbmBufferedSurface};
 use smithay::backend::egl::context::EGLContext;
 use smithay::backend::egl::display::EGLDisplay;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::gles2::Gles2Renderer;
+use smithay::backend::renderer::gles2::{Gles2Frame, Gles2Renderer};
 use smithay::backend::renderer::{Bind, ImportDma, ImportEgl, Renderer};
 use smithay::backend::session::auto::AutoSession;
 use smithay::backend::session::{Session, Signal};
 use smithay::backend::udev;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
+use smithay::reexports::calloop::timer::{Timer, TimerHandle};
 use smithay::reexports::calloop::{Dispatcher, EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::connector::State as ConnectorState;
 use smithay::reexports::drm::control::Device;
@@ -31,7 +32,7 @@ use crate::output::Output;
 
 pub fn run() {
     let mut event_loop = EventLoop::try_new().expect("event loop");
-    let udev = Udev::new(&event_loop, event_loop.handle());
+    let udev = Udev::new(event_loop.handle());
     let mut catacomb = Catacomb::new(&mut event_loop, udev);
 
     // Create backend and add presently connected devices.
@@ -96,27 +97,32 @@ pub fn run() {
 pub struct Udev {
     handle: LoopHandle<'static, Catacomb<Udev>>,
     output_device: Option<OutputDevice>,
+    render_timer: TimerHandle<DeviceId>,
     signaler: Signaler<Signal>,
     session: AutoSession,
     gpu: Option<PathBuf>,
 }
 
 impl Udev {
-    fn new(
-        event_loop: &EventLoop<Catacomb<Udev>>,
-        handle: LoopHandle<'static, Catacomb<Udev>>,
-    ) -> Self {
+    fn new(handle: LoopHandle<'static, Catacomb<Udev>>) -> Self {
         // Initialize the VT session.
         let (session, notifier) = AutoSession::new(None).expect("init session");
         let signaler = notifier.signaler();
 
         // Register session with the event loop so objects can link to the signaler.
-        event_loop.handle().insert_source(notifier, |_, _, _| {}).expect("insert notifier source");
+        handle.insert_source(notifier, |_, _, _| {}).expect("insert notifier source");
 
         // Find active GPUs for hardware acceleration.
         let gpu = udev::primary_gpu(session.seat()).ok().flatten();
 
-        Self { handle, signaler, session, gpu, output_device: None }
+        // Create timer for internally-triggerd redraws.
+        let render_timer = Timer::new().expect("setup render timer");
+        let timer_handle = render_timer.handle();
+        handle
+            .insert_source(render_timer, |device_id, _, catacomb| catacomb.render(device_id))
+            .expect("setting up render timer callback");
+
+        Self { handle, signaler, session, gpu, render_timer: timer_handle, output_device: None }
     }
 }
 
@@ -172,6 +178,8 @@ impl Catacomb<Udev> {
         let token = self.backend.handle.register_dispatcher(dispatcher)?;
 
         self.backend.output_device = Some(OutputDevice {
+            frame_interval: Duration::from_millis(self.output.frame_interval()),
+            timer: self.backend.render_timer.clone(),
             _restart_token: restart_token,
             id: device_id,
             gbm_surface,
@@ -272,33 +280,46 @@ impl Catacomb<Udev> {
 /// Target device for rendering.
 struct OutputDevice {
     gbm_surface: GbmBufferedSurface<GbmDevice<RawFd>, RawFd>,
+    timer: TimerHandle<DeviceId>,
     gbm: GbmDevice<RawFd>,
     renderer: Gles2Renderer,
     id: DeviceId,
 
     _restart_token: SignalToken,
+    frame_interval: Duration,
     token: RegistrationToken,
 }
 
 impl Render for &mut OutputDevice {
-    fn render<B>(&mut self, catacomb: &mut Catacomb<B>) -> Result<(), Box<dyn StdError>> {
+    fn render<B, F>(
+        &mut self,
+        catacomb: &mut Catacomb<B>,
+        draw_fun: F,
+    ) -> Result<(), Box<dyn StdError>>
+    where
+        F: FnOnce(&mut Catacomb<B>, &mut Gles2Renderer, &mut Gles2Frame, u8),
+    {
         // Mark the current frame as submitted.
         self.gbm_surface.frame_submitted()?;
 
         // Bind the next buffer to render into.
-        let (dmabuf, _age) = self.gbm_surface.next_buffer()?;
+        let (dmabuf, age) = self.gbm_surface.next_buffer()?;
         self.renderer.bind(dmabuf)?;
 
         // Draw the current frame into the buffer.
         let transform = catacomb.windows.orientation().transform();
         let output_size = catacomb.output.physical_resolution();
         self.renderer.render(output_size, transform, |renderer, frame| {
-            catacomb.draw(renderer, frame)
+            draw_fun(catacomb, renderer, frame, age)
         })?;
 
         // Queue buffer for rendering.
         self.gbm_surface.queue_buffer()?;
 
         Ok(())
+    }
+
+    fn reschedule(&mut self) {
+        self.timer.add_timeout(self.frame_interval, self.id);
     }
 }

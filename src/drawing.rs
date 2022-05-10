@@ -6,12 +6,15 @@ use std::rc::Rc;
 use smithay::backend::renderer::gles2::{ffi, Gles2Frame, Gles2Renderer, Gles2Texture};
 use smithay::backend::renderer::{self, Frame};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
-use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+use smithay::utils::{Buffer as BufferSpace, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::wayland::compositor::{BufferAssignment, Damage as SurfaceDamage, SurfaceAttributes};
 
 use crate::geometry::Vector;
 use crate::output::Output;
 use crate::overview::FG_OVERVIEW_PERCENTAGE;
+
+/// Maximum buffer age before damage information is discarded.
+pub const MAX_DAMAGE_AGE: usize = 2;
 
 /// Color of the hovered overview tiling location highlight.
 const ACTIVE_DROP_TARGET_RGBA: [u8; 4] = [128, 128, 128, 128];
@@ -43,21 +46,30 @@ const TOUCH_DEBUG_SIZE: usize = 50;
 /// the surface itself has already died.
 #[derive(Clone, Debug)]
 pub struct Texture {
-    size: Size<i32, Logical>,
+    damage: [Rectangle<f64, Physical>; MAX_DAMAGE_AGE],
     location: Point<i32, Logical>,
     texture: Rc<Gles2Texture>,
+    size: Size<i32, Logical>,
     transform: Transform,
     scale: i32,
 }
 
 impl Texture {
-    pub fn new(texture: Rc<Gles2Texture>, size: impl Into<Size<i32, Logical>>) -> Self {
+    pub fn new(
+        texture: Rc<Gles2Texture>,
+        size: impl Into<Size<i32, Logical>>,
+        output_scale: f64,
+    ) -> Self {
+        let size = size.into();
+        let physical_size = size.to_f64().to_physical(output_scale);
+        let damage = [Rectangle::from_loc_and_size((0., 0.), physical_size); MAX_DAMAGE_AGE];
         Self {
-            size: size.into(),
+            scale: 1,
             texture,
+            damage,
+            size,
             transform: Default::default(),
             location: Default::default(),
-            scale: 1,
         }
     }
 
@@ -67,8 +79,9 @@ impl Texture {
         buffer: &SurfaceBuffer,
     ) -> Self {
         Self {
-            location: location.into(),
+            damage: buffer.damage.physical,
             transform: buffer.transform,
+            location: location.into(),
             scale: buffer.scale,
             size: buffer.size,
             texture,
@@ -81,6 +94,7 @@ impl Texture {
         buffer: &[u8],
         width: i32,
         height: i32,
+        output_scale: f64,
     ) -> Self {
         assert!(buffer.len() as i32 >= width * height * 4);
 
@@ -108,7 +122,7 @@ impl Texture {
             })
             .expect("create texture");
 
-        Texture::new(Rc::new(texture), (width, height))
+        Texture::new(Rc::new(texture), (width, height), output_scale)
     }
 
     /// Render the texture at the specified location.
@@ -117,11 +131,12 @@ impl Texture {
     /// texture and truncate it to be within the specified window bounds. The scaling will always
     /// take part **before** the truncation.
     pub fn draw_at(
-        &self,
+        &mut self,
         frame: &mut Gles2Frame,
         output: &Output,
         window_bounds: Rectangle<i32, Logical>,
         window_scale: f64,
+        buffer_age: u8,
     ) {
         // Skip textures completely outside of the window bounds.
         let scaled_window_bounds = window_bounds.size.scale(1. / window_scale).max((1, 1));
@@ -140,11 +155,21 @@ impl Texture {
         let dst = Rectangle::from_loc_and_size(location, dst_size);
         let dst_physical = dst.to_f64().to_physical(output.scale());
 
+        // Calculate buffer damage.
+        let buffer_age = buffer_age as usize;
+        let full_damage = [Rectangle::from_loc_and_size((0., 0.), dst_physical.size)];
+        let damage = (buffer_age != 0).then(|| &self.damage[..buffer_age]).unwrap_or(&full_damage);
+
+        // Skip rendering surfaces without damage.
+        if damage.iter().all(|rect| rect == &Rectangle::default()) {
+            return;
+        }
+
         let _ = frame.render_texture_from_to(
             &self.texture,
             src_buffer,
             dst_physical,
-            &[Rectangle::from_loc_and_size((0., 0.), dst_physical.size)],
+            damage,
             self.transform,
             1.,
         );
@@ -167,7 +192,7 @@ pub struct Graphics {
 
 impl Graphics {
     /// Get the window decoration texture corresponding to the active output size.
-    pub fn decoration(&mut self, renderer: &mut Gles2Renderer, output: &Output) -> &Texture {
+    pub fn decoration(&mut self, renderer: &mut Gles2Renderer, output: &Output) -> &mut Texture {
         let expected_size = Self::decoration_size(output);
         if self.decoration.as_ref().map(|decoration| decoration.size) != Some(expected_size) {
             self.decoration = None;
@@ -177,24 +202,31 @@ impl Graphics {
     }
 
     /// Get the texture for the hovered overview drop target area.
-    pub fn active_drop_target(&mut self, renderer: &mut Gles2Renderer) -> &Texture {
-        self.active_drop_target
-            .get_or_insert_with(|| Texture::from_buffer(renderer, &ACTIVE_DROP_TARGET_RGBA, 1, 1))
+    pub fn active_drop_target(
+        &mut self,
+        renderer: &mut Gles2Renderer,
+        output_scale: f64,
+    ) -> &mut Texture {
+        self.active_drop_target.get_or_insert_with(|| {
+            Texture::from_buffer(renderer, &ACTIVE_DROP_TARGET_RGBA, 1, 1, output_scale)
+        })
     }
 
     /// Get the texture for the unfocused overview drop target area.
-    pub fn drop_target(&mut self, renderer: &mut Gles2Renderer) -> &Texture {
-        self.drop_target
-            .get_or_insert_with(|| Texture::from_buffer(renderer, &DROP_TARGET_RGBA, 1, 1))
+    pub fn drop_target(&mut self, renderer: &mut Gles2Renderer, output_scale: f64) -> &mut Texture {
+        self.drop_target.get_or_insert_with(|| {
+            Texture::from_buffer(renderer, &DROP_TARGET_RGBA, 1, 1, output_scale)
+        })
     }
 
-    pub fn touch_debug(&mut self, renderer: &mut Gles2Renderer) -> &Texture {
+    pub fn touch_debug(&mut self, renderer: &mut Gles2Renderer, output_scale: f64) -> &mut Texture {
         self.touch_debug.get_or_insert_with(|| {
             Texture::from_buffer(
                 renderer,
                 &[255; TOUCH_DEBUG_SIZE * TOUCH_DEBUG_SIZE * 4],
                 TOUCH_DEBUG_SIZE as i32,
                 TOUCH_DEBUG_SIZE as i32,
+                output_scale,
             )
         })
     }
@@ -254,7 +286,7 @@ impl Graphics {
         // Bottom border.
         fill(border_width, right_border, bottom_border, height, BORDER_RGBA);
 
-        Texture::from_buffer(renderer, &buffer, size.w, size.h)
+        Texture::from_buffer(renderer, &buffer, size.w, size.h, output.scale())
     }
 
     /// Total window decoration size.
@@ -276,6 +308,7 @@ pub struct SurfaceBuffer {
     pub size: Size<i32, Logical>,
     pub buffer: Option<Buffer>,
     pub transform: Transform,
+    pub damage: Damage,
     pub scale: i32,
 }
 
@@ -283,10 +316,11 @@ impl Default for SurfaceBuffer {
     fn default() -> Self {
         Self {
             scale: 1,
-            size: Default::default(),
             transform: Default::default(),
             texture: Default::default(),
             buffer: Default::default(),
+            damage: Default::default(),
+            size: Default::default(),
         }
     }
 }
@@ -311,6 +345,28 @@ impl SurfaceBuffer {
             BufferAssignment::Removed => *self = Self::default(),
         }
     }
+
+    /// Add new surface damage.
+    pub fn add_damage(&mut self, output_scale: f64, damage: impl Iterator<Item = SurfaceDamage>) {
+        for damage in damage {
+            let (buffer, physical) = match damage {
+                SurfaceDamage::Buffer(buffer) => {
+                    let buffer_size = self.size.to_buffer(self.scale, self.transform);
+                    let logical = buffer.to_logical(self.scale, self.transform, &buffer_size);
+                    let physical = logical.to_f64().to_physical(output_scale);
+                    (buffer, physical)
+                },
+                SurfaceDamage::Surface(logical) => {
+                    let buffer = logical.to_buffer(self.scale, self.transform, &self.size);
+                    let physical = logical.to_f64().to_physical(output_scale);
+                    (buffer, physical)
+                },
+            };
+
+            self.damage.physical[0] = self.damage.physical[0].merge(physical);
+            self.damage.buffer.push(buffer);
+        }
+    }
 }
 
 /// Container for automatically releasing a buffer on drop.
@@ -327,5 +383,41 @@ impl Deref for Buffer {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Surface damage history.
+#[derive(Default)]
+pub struct Damage {
+    /// Damage history in physical coordinates.
+    physical: [Rectangle<f64, Physical>; MAX_DAMAGE_AGE],
+    /// Buffer damage since last import.
+    buffer: Vec<Rectangle<i32, BufferSpace>>,
+}
+
+impl Damage {
+    /// Clear the surface's damage slot of unimported changes.
+    ///
+    /// This function should be called exactly once after importing the damage
+    /// into the texture cache.
+    pub fn clear(&mut self) {
+        self.physical.rotate_right(1);
+        self.physical[0] = Rectangle::default();
+        self.buffer.clear();
+    }
+
+    /// Retrieve buffer damage since last import.
+    pub fn buffer(&self) -> &[Rectangle<i32, BufferSpace>] {
+        self.buffer.as_slice()
+    }
+
+    /// Retrieve physical damage history.
+    pub fn physical(&self) -> &[Rectangle<f64, Physical>] {
+        &self.physical
+    }
+
+    /// Check if there has been damage since the last draw.
+    pub fn damaged(&self) -> bool {
+        !self.buffer.is_empty()
     }
 }

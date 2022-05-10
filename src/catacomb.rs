@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
-use std::{cmp, env, io};
+use std::{env, io};
 
 use server_decoration::server::org_kde_kwin_server_decoration_manager::Mode;
 use smithay::backend::renderer::gles2::{Gles2Frame, Gles2Renderer};
@@ -165,8 +165,14 @@ impl<B> Catacomb<B> {
         // Update transaction before rendering to update device orientation.
         self.windows.update_transaction();
 
-        // Draw the content with the backend-specific renderer.
-        let _ = renderer.render(self);
+        // Redraw only when there is damage present.
+        if self.windows.damaged() {
+            // Draw the content with the backend-specific renderer.
+            let _ = renderer
+                .render(self, |catacomb, renderer, frame, age| catacomb.draw(renderer, frame, age));
+        } else {
+            renderer.reschedule();
+        }
 
         // Handle window liveliness changes.
         self.windows.refresh(&mut self.output);
@@ -176,26 +182,30 @@ impl<B> Catacomb<B> {
     }
 
     /// Draw the current compositor state.
-    pub fn draw(&mut self, renderer: &mut Gles2Renderer, frame: &mut Gles2Frame) {
+    pub fn draw(
+        &mut self,
+        renderer: &mut Gles2Renderer,
+        frame: &mut Gles2Frame,
+        mut buffer_age: u8,
+    ) {
         // Clear the screen.
-        let output_size = self.output.physical_resolution();
-        let size = cmp::max(output_size.w, output_size.h) as f64;
-        let full_rect = Rectangle::from_loc_and_size((0., 0.), (size, size));
-        let _ = frame.clear([1., 0., 1., 1.], &[full_rect]);
+        let damage = self.windows.damage(&self.output, &mut buffer_age);
+        println!("CLEARING: {:?}", damage);
+        let _ = frame.clear([1., 0., 1., 1.], &damage);
 
         // Render debug indicator showing current touch location.
         if self.touch_debug {
             let loc = self.touch_state.position.to_i32_round();
-            let touch_debug = self.graphics.touch_debug(renderer);
+            let touch_debug = self.graphics.touch_debug(renderer, self.output.scale());
             let rect = Rectangle::from_loc_and_size(loc, (i32::MAX, i32::MAX));
-            touch_debug.draw_at(frame, &self.output, rect, 1.);
+            touch_debug.draw_at(frame, &self.output, rect, 1., 0);
         }
 
         if let Some(surface) = self.windows.focus_request() {
             self.focus(surface.as_ref());
         }
 
-        self.windows.draw(renderer, frame, &mut self.graphics, &self.output);
+        self.windows.draw(renderer, frame, &mut self.graphics, &self.output, buffer_age);
     }
 
     /// Focus a new surface.
@@ -214,5 +224,18 @@ pub trait Backend {
 
 /// Abstraction over backend-specific rendering.
 pub trait Render {
-    fn render<B>(&mut self, catacomb: &mut Catacomb<B>) -> Result<(), Box<dyn Error>>;
+    /// Render the frame, using the provided drawing function.
+    fn render<B, F>(
+        &mut self,
+        catacomb: &mut Catacomb<B>,
+        draw_fun: F,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: FnOnce(&mut Catacomb<B>, &mut Gles2Renderer, &mut Gles2Frame, u8);
+
+    /// Re-schedule the rendering.
+    ///
+    /// Re-rendering at a later point will be requested when the current frame completed without
+    /// any damage present.
+    fn reschedule(&mut self) {}
 }

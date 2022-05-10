@@ -50,13 +50,14 @@ impl Layers {
         renderer: &mut Gles2Renderer,
         frame: &mut Gles2Frame,
         output: &Output,
+        buffer_age: u8,
     ) {
         for window in &mut self.background {
-            window.draw(renderer, frame, output, 1., None);
+            window.draw(renderer, frame, output, 1., None, buffer_age);
         }
 
         for window in &mut self.bottom {
-            window.draw(renderer, frame, output, 1., None);
+            window.draw(renderer, frame, output, 1., None, buffer_age);
         }
     }
 
@@ -66,13 +67,14 @@ impl Layers {
         renderer: &mut Gles2Renderer,
         frame: &mut Gles2Frame,
         output: &Output,
+        buffer_age: u8,
     ) {
         for window in &mut self.top {
-            window.draw(renderer, frame, output, 1., None);
+            window.draw(renderer, frame, output, 1., None, buffer_age);
         }
 
         for window in &mut self.overlay {
-            window.draw(renderer, frame, output, 1., None);
+            window.draw(renderer, frame, output, 1., None, buffer_age);
         }
     }
 
